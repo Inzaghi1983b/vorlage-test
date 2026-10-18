@@ -1,0 +1,504 @@
+name: Agent-Gate
+
+# Prueft Agenten-PRs (Autor github-actions[bot] oder die eigene Mini-App) nach jedem abgeschlossenen CI-Lauf und aktiviert dann
+# GitHub-Auto-Merge, aber nur wenn das Repo Auto-Merge erlaubt (allow_auto_merge); sonst bleibt der PR unberuehrt. Trigger workflow_run, weil per GITHUB_TOKEN erzeugte PRs kein pull_request_target
+# ausloesen (belegt in ch-import #24/#25: 0 Laeufe). Fuehrt NIE Code oder Artefakte aus dem PR aus:
+# kein Checkout, nur API-Aufrufe. Alles Wesentliche (Lauf, PR, Autor, HEAD, Pflicht-Check) wird
+# unabhaengig ueber die GitHub-API geprueft, nicht dem Ereignis geglaubt.
+# Setzt pro Commit den Check-Run "agent-gate" (success/failure); er ist im Ruleset main-schutz Pflicht-Check.
+# Fehlt er (Gate lief nicht / neuer HEAD), ist der Merge blockiert.
+# Nach einem Merge durch das Gate: CI auf dem Standard-Branch starten, verknuepfte Issues schliessen, den
+# gemergten Agenten-Branch loeschen. Kill-Switch: ist die CI des Standard-Branches rot, fehlt sie oder laeuft
+# sie noch, wird agent-gate rot; nach gruener CI auf dem Standard-Branch bewertet das Gate offene
+# Agenten-PRs neu (hoechstens ein Merge je CI-Zyklus).
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: agent-gate-${{ github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.id }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write # nur: CI auf dem Standard-Branch nach dem Merge starten (workflow run)
+      checks: write
+      contents: write # Auto-Merge/Merge und Loeschen gemergter Agenten-Branches
+      issues: write # nur: verknuepfte Issues nach dem Merge schliessen
+      pull-requests: write
+    steps:
+      - name: Pruefen und Auto-Merge aktivieren
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import shlex
+          import subprocess
+          import sys
+          import time
+          from urllib.parse import quote
+
+          GH = shlex.split(os.environ.get("GH_BIN", "gh"))
+          REPO = os.environ["REPO"]
+          EREIGNIS_RUN = os.environ["RUN_ID"]
+          EREIGNIS_SHA = os.environ["HEAD_SHA"]
+          # Erlaubte Bot-Autoren: gh-aw-Standard und die eigene Mini-App (Slug nach App-Anlage eintragen).
+          AGENT_AUTHORS = ("github-actions[bot]", "ai-projects-agent-pr[bot]")
+          CI_NAME = "CI"
+          CI_PFAD = ".github/workflows/ci.yml"
+          PFLICHT_CHECK = "test"
+          CHECK_NAME = "agent-gate"  # wird im Ruleset Pflicht-Check (App 15368)
+          PFLICHT_APP_ID = 15368  # GitHub Actions
+          CI_DATEI = "ci.yml"
+          WARTE_VERSUCHE = 18  # nach --auto hoechstens 18 x 5 s auf den Merge von GitHub warten
+          WARTE_SEKUNDEN = float(os.environ.get("WARTE_SEKUNDEN", "5"))
+          MAX_NACHLAUF = 20  # offene Agenten-PRs, die nach gruener main-CI neu bewertet werden
+
+          ERLAUBT = re.compile(r"^(src|tests)/")
+          MAX_ZEILEN = 800
+          MAX_DATEIEN = 50
+          TEST_SKIP = re.compile(
+              r"pytest\.mark\.(skip|skipif|xfail)|pytest\.(skip|xfail)\(|importorskip|unittest\.skip"
+          )
+          SRC_RISIKO = re.compile(
+              r"^\s*(import|from)\s+(socket|requests|urllib|http|ftplib|smtplib|subprocess|ctypes"
+              r"|multiprocessing|pickle|shelve)\b|os\.(system|popen)|\beval\(|\bexec\(|__import__"
+          )
+          ASSERT = re.compile(r"^\s*(assert\b|with\s+pytest\.raises|def\s+test_)")
+          # Vorab von Menschen geschriebene Akzeptanztests: Bot-PRs duerfen sie weder anlegen noch aendern.
+          GESCHUETZT = "tests/akzeptanz/"
+          # Spec-first: jedes geaenderte Modul src/<paket>/<modul>.py braucht auf dem Standard-Branch
+          # den von Menschen gemergten Akzeptanztest tests/akzeptanz/test_<modul>.py.
+          MODUL = re.compile(r"^src/(?:[^/]+/)+([A-Za-z0-9][A-Za-z0-9_]*)\.py$")
+          # Vom Agenten deklarierte Abweichung vom Auftrag (Zeile "ABWEICHUNG: ..." im PR-Text).
+          ABWEICHUNG = re.compile(r"^[\s>*_-]*ABWEICHUNG\b[\s*_]*:[\s*_]*(.*)$", re.I | re.M)
+          KEINE_ABWEICHUNG = {"keine", "kein", "nein", "-", "none", "n/a", "entfaellt"}
+
+
+          def gh(*args, fatal=True):
+              r = subprocess.run([*GH, *args], capture_output=True, text=True)
+              if r.returncode != 0:
+                  print(f"gh {' '.join(args)} endete mit Code {r.returncode}: {r.stderr.strip()}")
+                  if fatal:
+                      sys.exit(1)
+              return r.stdout
+
+
+          def s(text):
+              # Workflow-Befehle (::...::) aus fremden Texten im Log unschaedlich machen.
+              return str(text).replace("::", ": :")
+
+
+          def json_folge(text):
+              teile, dec, i = [], json.JSONDecoder(), 0
+              while i < len(text):
+                  if text[i].isspace():
+                      i += 1
+                      continue
+                  obj, i = dec.raw_decode(text, i)
+                  teile.append(obj)
+              return teile
+
+
+          def bewerte(pr, dateien, akzeptanz):
+              """Gibt die Liste der Verstoesse zurueck; leer = Aenderung zulaessig."""
+              v = []
+              if not pr["title"].startswith("[agent] "):
+                  v.append("Titel ohne Praefix '[agent] '")
+              if pr["additions"] + pr["deletions"] > MAX_ZEILEN:
+                  v.append(f"zu gross: {pr['additions'] + pr['deletions']} Zeilen (max {MAX_ZEILEN})")
+              if len(dateien) > MAX_DATEIEN:
+                  v.append(f"zu viele Dateien: {len(dateien)} (max {MAX_DATEIEN})")
+              entfernt = hinzu = 0
+              for d in dateien:
+                  pfade = [d["filename"]] + ([d["previous_filename"]] if d.get("previous_filename") else [])
+                  for p in pfade:
+                      if not ERLAUBT.match(p) or "/../" in p or p.startswith("../"):
+                          v.append(f"Datei ausserhalb src/ und tests/: {s(p)}")
+                      if p.lower().startswith(GESCHUETZT):
+                          v.append(f"geschuetzter Akzeptanztest veraendert: {s(p)}")
+                  name = d["filename"]
+                  if d["status"] == "removed" and name.startswith("tests/"):
+                      v.append(f"Testdatei geloescht: {s(name)}")
+                  if d["status"] != "removed" and not d.get("patch"):
+                      v.append(f"kein pruefbarer Patch (binaer oder zu gross): {s(name)}")
+                  for zeile in (d.get("patch") or "").splitlines():
+                      if zeile.startswith("+"):
+                          inhalt = zeile[1:]
+                          if name.startswith("tests/") and TEST_SKIP.search(inhalt):
+                              v.append(f"Test uebersprungen/xfail in {s(name)}: {s(inhalt.strip())}")
+                          if name.startswith("src/") and SRC_RISIKO.search(inhalt):
+                              v.append(f"riskanter Aufruf/Import in {s(name)}: {s(inhalt.strip())}")
+                      if name.startswith("tests/") and ASSERT.match(zeile[1:]):
+                          if zeile.startswith("-"):
+                              entfernt += 1
+                          elif zeile.startswith("+"):
+                              hinzu += 1
+              if entfernt > hinzu:
+                  v.append(f"Assertions/Tests netto reduziert: {entfernt} entfernt, {hinzu} hinzugefuegt")
+              module = sorted({m.group(1) for d in dateien if d["status"] != "removed"
+                               for m in [MODUL.match(d["filename"])] if m})
+              for modul in module:
+                  if f"test_{modul}.py" not in akzeptanz:
+                      v.append(f"kein Akzeptanztest (spec-first): tests/akzeptanz/test_{s(modul)}.py "
+                               "fehlt auf dem Standard-Branch")
+              for m in ABWEICHUNG.finditer(pr.get("body") or ""):
+                  text = m.group(1).strip().strip("*_ .").lower()
+                  if text not in KEINE_ABWEICHUNG:
+                      v.append(f"Abweichung vom Auftrag deklariert (Mensch pruefen): {s(m.group(1).strip())[:200]}")
+              return v
+
+
+          ERGEBNIS = {"text": "", "melden": False}
+
+
+          def stopp(text):
+              print(f"STOPP: {s(text)}")
+              ERGEBNIS["text"] = f"STOPP: {s(text)}"
+              return 1
+
+
+          def melde(sha, conclusion, text):
+              """Setzt den Check-Run agent-gate fuer genau diesen Commit (fehlt er, ist der Merge blockiert)."""
+              felder = ["-f", "status=completed", "-f", f"conclusion={conclusion}",
+                        "-f", f"output[title]=Agent-Gate: {conclusion}", "-f", f"output[summary]={s(text)[:900]}"]
+              vorhanden = [c for teil in json_folge(gh("api", "--paginate",
+                                                       f"repos/{REPO}/commits/{sha}/check-runs?check_name={CHECK_NAME}"))
+                           for c in teil["check_runs"]
+                           if c["name"] == CHECK_NAME and c["app"]["id"] == PFLICHT_APP_ID]
+              if vorhanden:
+                  gh("api", "-X", "PATCH", f"repos/{REPO}/check-runs/{vorhanden[-1]['id']}", *felder)
+              else:
+                  gh("api", "-X", "POST", f"repos/{REPO}/check-runs", "-f", f"name={CHECK_NAME}",
+                     "-f", f"head_sha={sha}", *felder)
+
+
+          def versuche(*args):
+              """gh-Aufruf ohne Abbruch: (Rueckgabecode, stdout, stderr)."""
+              r = subprocess.run([*GH, *args], capture_output=True, text=True)
+              if r.returncode != 0:
+                  print(f"WARNUNG gh {' '.join(args)[:120]} endete mit Code {r.returncode}: {s(r.stderr.strip())[:200]}")
+              return r.returncode, r.stdout, r.stderr
+
+
+          STAND = {"gemergt": 0, "fehler": 0}
+
+
+          def main_zustand(standard):
+              """Kill-Switch: (zustand, text, sha) fuer den aktuellen Commit des Standard-Branches.
+
+              zustand: ok (CI gruen) | rot | laeuft (CI noch nicht fertig) | keine (keine CI) | unklar (nicht lesbar).
+              """
+              try:
+                  sha = json.loads(gh("api", f"repos/{REPO}/commits/{standard}", fatal=False))["sha"]
+                  runs = json.loads(
+                      gh("api", f"repos/{REPO}/actions/workflows/{CI_DATEI}/runs?head_sha={sha}&per_page=30", fatal=False)
+                  )["workflow_runs"]
+              except (ValueError, TypeError, KeyError):
+                  return "unklar", f"Zustand von {standard} nicht lesbar", ""
+              runs = [r for r in runs if r["event"] in ("push", "workflow_dispatch") and r["head_sha"] == sha]
+              if not runs:
+                  return "keine", f"keine CI auf {standard} fuer {sha[:8]}", sha
+              neu = max(runs, key=lambda r: r["created_at"])
+              if neu["status"] != "completed":
+                  return "laeuft", f"CI auf {standard} laeuft noch ({sha[:8]})", sha
+              if neu["conclusion"] != "success":
+                  return "rot", f"CI auf {standard} nicht gruen ({neu['conclusion']}, {sha[:8]})", sha
+              return "ok", f"CI auf {standard} gruen ({sha[:8]})", sha
+
+
+          def _nach_merge(pr_nr, standard):
+              """Nach dem Merge: CI auf main, verknuepfte Issues schliessen, Branch loeschen (je einzeln, idempotent).
+
+              Gibt die Anzahl fehlgeschlagener Schritte zurueck; der Merge selbst bleibt davon unberuehrt.
+              """
+              p = json.loads(gh("api", f"repos/{REPO}/pulls/{pr_nr}"))
+              if not p.get("merged"):
+                  print("PR noch nicht gemergt (Auto-Merge wartet): kein Nachlauf.")
+                  return 0
+              STAND["gemergt"] += 1
+              probleme = 0
+              # 1) CI auf dem Standard-Branch, falls fuer den neuen Stand noch keine existiert
+              zustand, text, _ = main_zustand(standard)
+              if zustand == "keine":
+                  rc, _, _ = versuche("workflow", "run", CI_DATEI, "--repo", REPO, "--ref", standard)
+                  print("CI auf main ausgeloest." if rc == 0 else "CI auf main NICHT ausgeloest.")
+                  probleme += rc != 0
+              else:
+                  print(f"CI auf main nicht neu ausgeloest: {text}.")
+              # 2) verknuepfte Issues schliessen
+              owner, name = REPO.split("/", 1)
+              frage = (
+                  "query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n)"
+                  "{closingIssuesReferences(first:20){nodes{number state repository{nameWithOwner}}}}}}"
+              )
+              rc, out, _ = versuche("api", "graphql", "-f", f"query={frage}", "-f", f"o={owner}", "-f", f"r={name}",
+                                    "-F", f"n={pr_nr}")
+              try:
+                  knoten = json.loads(out)["data"]["repository"]["pullRequest"]["closingIssuesReferences"]["nodes"]
+              except (ValueError, TypeError, KeyError):
+                  knoten = []
+                  print("Verknuepfte Issues nicht lesbar.")
+                  probleme += 1
+              for k in knoten:
+                  if k["repository"]["nameWithOwner"] != REPO or k["state"] != "OPEN":
+                      continue
+                  rc, _, _ = versuche("issue", "close", str(k["number"]), "--repo", REPO, "--reason", "completed",
+                                      "--comment", f"Umgesetzt und automatisch gemergt in #{pr_nr} (agent-gate und CI gruen).")
+                  print(f"Issue #{k['number']} geschlossen." if rc == 0 else f"Issue #{k['number']} NICHT geschlossen.")
+                  probleme += rc != 0
+              # 3) Branch loeschen: nur im selben Repo, nie der Standard-Branch, nur wenn er noch auf dem gemergten Stand steht
+              ref = p["head"]["ref"]
+              if not p["head"].get("repo") or p["head"]["repo"]["full_name"] != REPO or ref == standard:
+                  print("Branch nicht im Repo oder Standard-Branch: nicht geloescht.")
+                  return probleme
+              pfad = f"repos/{REPO}/git/ref/heads/{quote(ref, safe='/')}"
+              rc, out, err = versuche("api", pfad)
+              if rc != 0:
+                  if "404" in out + err or "Not Found" in out + err:
+                      print("Branch ist schon geloescht.")
+                      return probleme
+                  return probleme + 1
+              try:
+                  aktuell = json.loads(out)["object"]["sha"]
+              except (ValueError, TypeError, KeyError):
+                  print("Branch-Stand nicht lesbar: nicht geloescht.")
+                  return probleme + 1
+              if aktuell != p["head"]["sha"]:
+                  print("Branch ist seit dem Merge weitergezogen: nicht geloescht.")
+                  return probleme
+              rc, _, _ = versuche("api", "-X", "DELETE", f"repos/{REPO}/git/refs/heads/{quote(ref, safe='/')}")
+              print("Branch geloescht." if rc == 0 else "Branch NICHT geloescht.")
+              return probleme + (rc != 0)
+
+
+          def nach_merge(pr_nr, standard):
+              """Wie _nach_merge, merkt sich aber fehlgeschlagene Schritte fuer den Exit-Code des Nachlaufs."""
+              probleme = _nach_merge(pr_nr, standard)
+              STAND["fehler"] += probleme
+              return probleme
+
+
+          def gemergte_prs(sha):
+              """Gemergte PRs mit genau diesem Commit als Head (fuer CI-Re-Runs nach dem Merge); None = nicht lesbar.
+
+              Nach dem Merge listet GitHub am CI-Lauf keine PRs mehr (pull_requests ist leer).
+              """
+              try:
+                  liste = [x for teil in json_folge(gh("api", "--paginate", f"repos/{REPO}/commits/{sha}/pulls",
+                                                       fatal=False)) for x in teil]
+                  return [
+                      x for x in liste
+                      if x.get("merged_at") and x["head"]["sha"] == sha
+                      and (x["head"].get("repo") or {}).get("full_name") == REPO
+                      and x["base"]["repo"]["full_name"] == REPO
+                  ]
+              except (ValueError, TypeError, AttributeError, KeyError):
+                  return None
+
+
+          def warte_auf_merge(pr_nr, head_sha):
+              """Nach `gh pr merge --auto`: begrenzt warten, bis GitHub gemergt hat (Pflicht-Checks koennen noch laufen)."""
+              for i in range(WARTE_VERSUCHE + 1):
+                  try:
+                      p = json.loads(gh("api", f"repos/{REPO}/pulls/{pr_nr}", fatal=False))
+                      if p.get("merged"):
+                          return True
+                      wartet = p["state"] == "open" and p["head"]["sha"] == head_sha and bool(p.get("auto_merge"))
+                  except (ValueError, TypeError, KeyError, AttributeError):
+                      print("PR-Zustand beim Warten auf den Merge nicht lesbar.")
+                      STAND["fehler"] += 1
+                      return False
+                  if not wartet:
+                      print("Auto-Merge nicht mehr aktiv, PR geschlossen oder HEAD geaendert: kein Warten.")
+                      return False
+                  if i < WARTE_VERSUCHE:
+                      time.sleep(WARTE_SEKUNDEN)
+              print(f"Nicht innerhalb von {WARTE_VERSUCHE} Versuchen gemergt: GitHub merged spaeter; "
+                    "ein CI-Re-Run des PR holt den Nachlauf dann nach.")
+              return False
+
+
+          def pruefe(run_id, head_sha):
+              ERGEBNIS.update(text="", melden=False)
+              lauf = json.loads(gh("api", f"repos/{REPO}/actions/runs/{run_id}"))
+              if lauf["repository"]["full_name"] != REPO or lauf["name"] != CI_NAME or lauf["path"] != CI_PFAD:
+                  return stopp("kein CI-Lauf dieses Repos")
+              if lauf["event"] != "pull_request" or lauf["status"] != "completed":
+                  print("Kein abgeschlossener Pull-Request-CI-Lauf: uebersprungen.")
+                  return 0
+              if lauf["head_sha"] != head_sha or lauf["head_repository"]["full_name"] != REPO:
+                  return stopp("Lauf passt nicht zum Ereignis oder stammt aus einem Fork")
+              if lauf["conclusion"] in ("cancelled", "skipped", "action_required", "stale"):
+                  print(f"CI-Lauf {lauf['conclusion']}: nichts zu tun.")
+                  return 0
+              zuordnung = lauf.get("pull_requests") or []
+              if len(zuordnung) > 1:
+                  ERGEBNIS["melden"] = True
+                  return stopp(f"CI-Lauf ist mehreren PRs zugeordnet ({len(zuordnung)})")
+              if len(zuordnung) == 1:
+                  pr_nr = str(zuordnung[0]["number"])
+              else:
+                  kandidaten = gemergte_prs(head_sha)
+                  if kandidaten is None:
+                      return stopp("Zuordnung des Commits zu PRs nicht lesbar")
+                  if len(kandidaten) > 1:
+                      return stopp(f"Commit gehoert zu mehreren gemergten PRs ({len(kandidaten)})")
+                  if not kandidaten:
+                      print("CI-Lauf ist keinem offenen oder gemergten PR zugeordnet: nichts zu tun.")
+                      return 0
+                  pr_nr = str(kandidaten[0]["number"])
+              pr = json.loads(gh("api", f"repos/{REPO}/pulls/{pr_nr}"))
+              bot = pr["user"]["login"] in AGENT_AUTHORS and pr["user"]["type"] == "Bot"
+              repo = json.loads(gh("api", f"repos/{REPO}"))
+              standard = repo["default_branch"]
+              if pr.get("merged"):
+                  # Auf gemergte PRs schreibt das Gate nie einen Check; es holt nur fehlende Nachlauf-Schritte nach.
+                  if not bot or pr["head"]["sha"] != head_sha:
+                      print("Gemergter PR ist kein Agenten-PR oder gehoert zu einem anderen Commit: nichts zu tun.")
+                      return 0
+                  print("PR ist bereits gemergt: Nachlauf wird idempotent wiederholt.")
+                  return 1 if nach_merge(pr_nr, standard) else 0
+              if pr["state"] != "open":
+                  print("PR ist geschlossen (nicht gemergt): nichts zu tun.")
+                  return 0
+              ERGEBNIS["melden"] = True
+              if lauf["conclusion"] != "success":
+                  return stopp(f"CI-Lauf nicht erfolgreich ({lauf['conclusion']})")
+              if not bot:
+                  print(f"Kein Agenten-PR (Autor {s(pr['user']['login'])}): uebersprungen.")
+                  ERGEBNIS["text"] = f"Kein Agenten-PR (Autor {s(pr['user']['login'])}): nicht zustaendig."
+                  return 0
+              if ((pr["head"].get("repo") or {}).get("full_name") != REPO
+                      or pr["base"]["repo"]["full_name"] != REPO or pr["base"]["ref"] != standard):
+                  return stopp("PR aus Fork oder nicht gegen den Standard-Branch")
+              if pr["head"]["sha"] != head_sha:
+                  return stopp("HEAD hat sich seit dem CI-Lauf geaendert; der neue CI-Lauf loest eine neue Pruefung aus")
+              checks = [c for teil in json_folge(gh("api", "--paginate", f"repos/{REPO}/commits/{head_sha}/check-runs"))
+                        for c in teil["check_runs"]]
+              pflicht = [c for c in checks if c["name"] == PFLICHT_CHECK and c["app"]["id"] == PFLICHT_APP_ID]
+              if len(pflicht) != 1 or pflicht[0]["conclusion"] != "success" or pflicht[0]["head_sha"] != head_sha:
+                  return stopp(f"Pflicht-Check '{PFLICHT_CHECK}' nicht genau einmal erfolgreich")
+              dateien = [x for teil in json_folge(gh("api", "--paginate", f"repos/{REPO}/pulls/{pr_nr}/files"))
+                         for x in teil]
+              try:
+                  liste = json.loads(gh("api", f"repos/{REPO}/contents/tests/akzeptanz?ref={standard}",
+                                       fatal=False))
+                  akzeptanz = {e["name"] for e in liste}
+              except (ValueError, TypeError, KeyError):
+                  akzeptanz = set()  # Verzeichnis fehlt oder API-Fehler: sicher = keine Akzeptanztests
+              verstoesse = bewerte(pr, dateien, akzeptanz)
+              if verstoesse:
+                  print("Gate NICHT bestanden:")
+                  for eintrag in verstoesse:
+                      print(f"  - {eintrag}")
+                  ERGEBNIS["text"] = "; ".join(verstoesse)
+                  gh("pr", "merge", pr_nr, "--repo", REPO, "--disable-auto", fatal=False)
+                  return 1
+              zustand, mtext, _ = main_zustand(standard)
+              if zustand != "ok":
+                  ERGEBNIS["text"] = f"Kill-Switch: {mtext}; keine automatische Integration"
+                  print(f"STOPP: {ERGEBNIS['text']}")
+                  gh("pr", "merge", pr_nr, "--repo", REPO, "--disable-auto", fatal=False)
+                  return 1
+              print(f"Gate bestanden: PR {pr_nr}, {len(dateien)} Datei(en), HEAD {head_sha[:8]}.")
+              ERGEBNIS["text"] = f"Gate bestanden: {len(dateien)} Datei(en), HEAD {head_sha[:8]}."
+              melde(head_sha, "success", ERGEBNIS["text"])
+              ERGEBNIS["melden"] = False
+              if not repo.get("allow_auto_merge"):
+                  # Sonst wuerde `gh pr merge --auto` einen bereits gruenen PR sofort direkt mergen.
+                  print("Auto-Merge ist im Repo nicht erlaubt: keine Integration, Draft-Status unveraendert.")
+                  return 0
+              if pr.get("draft"):
+                  gh("pr", "ready", pr_nr, "--repo", REPO)
+              if pr.get("auto_merge"):
+                  print("Auto-Merge war schon aktiv; der Check dieses Stands ist trotzdem bestanden.")
+                  return 0
+              gh("pr", "merge", pr_nr, "--repo", REPO, "--auto", "--squash", "--match-head-commit", head_sha)
+              STAND["gemergt"] += 1  # ab jetzt laeuft/wartet ein Merge: kein weiterer Merge in diesem CI-Zyklus
+              print("Auto-Merge aktiviert; GitHub merged, sobald alle Pflicht-Checks gruen sind.")
+              if warte_auf_merge(pr_nr, head_sha):
+                  return 1 if nach_merge(pr_nr, standard) else 0
+              return 1 if STAND["fehler"] else 0
+
+
+          def nachlauf(lauf):
+              """CI auf dem Standard-Branch fertig: offene Agenten-PRs neu bewerten (Kill-Switch kann frei sein)."""
+              if lauf["status"] != "completed" or lauf["conclusion"] != "success":
+                  print("CI auf dem Standard-Branch nicht erfolgreich: nichts zu tun.")
+                  return 0
+              standard = json.loads(gh("api", f"repos/{REPO}"))["default_branch"]
+              if lauf.get("head_branch") != standard or lauf["head_repository"]["full_name"] != REPO:
+                  print("Kein CI-Lauf des Standard-Branches: uebersprungen.")
+                  return 0
+              zustand, mtext, sha = main_zustand(standard)
+              if zustand != "ok" or sha != lauf["head_sha"]:
+                  print(f"Lauf gehoert nicht zum aktuellen Stand von {standard} ({mtext}): nichts zu tun.")
+                  return 0
+              prs = [x for teil in json_folge(gh("api", "--paginate",
+                                               f"repos/{REPO}/pulls?state=open&base={standard}&per_page=50")) for x in teil]
+              kandidaten = [
+                  x for x in prs
+                  if x["user"]["login"] in AGENT_AUTHORS and x["user"]["type"] == "Bot"
+                  and x["head"].get("repo") and x["head"]["repo"]["full_name"] == REPO
+              ][:MAX_NACHLAUF]
+              fehler = 0
+              for x in kandidaten:
+                  if STAND["gemergt"]:
+                      print("Es wurde schon gemergt: weitere PRs warten auf die naechste CI auf dem Standard-Branch.")
+                      break
+                  sha_pr = x["head"]["sha"]
+                  try:
+                      runs = json.loads(gh("api", f"repos/{REPO}/actions/workflows/{CI_DATEI}/runs"
+                                           f"?head_sha={sha_pr}&event=pull_request&status=success&per_page=10",
+                                           fatal=False))["workflow_runs"]
+                  except (ValueError, TypeError, KeyError):
+                      runs = []
+                  runs = [r for r in runs if r["head_sha"] == sha_pr and r["conclusion"] == "success"]
+                  if not runs:
+                      print(f"PR {x['number']}: keine gruene CI fuer {sha_pr[:8]}: uebersprungen.")
+                      continue
+                  neu = max(runs, key=lambda r: r["created_at"])
+                  print(f"Nachlauf PR {x['number']} (CI-Lauf {neu['id']}, {sha_pr[:8]})")
+                  try:
+                      code = pruefe(str(neu["id"]), sha_pr)
+                      if ERGEBNIS["melden"]:
+                          melde(sha_pr, "success" if code == 0 else "failure", ERGEBNIS["text"] or "ohne Angabe")
+                      print(f"PR {x['number']}: Ergebnis {'ok' if code == 0 else 'nicht freigegeben'}.")
+                  except (SystemExit, ValueError, KeyError, TypeError):
+                      print(f"FEHLER bei PR {x['number']}: gh-Aufruf fehlgeschlagen.")
+                      fehler += 1
+              return 1 if fehler or STAND["fehler"] else 0
+
+
+          def main():
+              lauf = json.loads(gh("api", f"repos/{REPO}/actions/runs/{EREIGNIS_RUN}"))
+              if lauf["repository"]["full_name"] != REPO or lauf["name"] != CI_NAME or lauf["path"] != CI_PFAD:
+                  return stopp("kein CI-Lauf dieses Repos")
+              if lauf["event"] == "pull_request":
+                  code = pruefe(EREIGNIS_RUN, EREIGNIS_SHA)
+                  if ERGEBNIS["melden"]:
+                      melde(EREIGNIS_SHA, "success" if code == 0 else "failure", ERGEBNIS["text"] or "ohne Angabe")
+                  return code
+              if lauf["event"] in ("push", "workflow_dispatch"):
+                  return nachlauf(lauf)
+              print("Kein Pull-Request- oder Standard-Branch-CI-Lauf: uebersprungen.")
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
