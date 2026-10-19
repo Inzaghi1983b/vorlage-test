@@ -90,7 +90,8 @@ MUTANTEN = {
     "G1 Mint ohne continue-on-error": ("continue-on-error: true", "continue-on-error: false"),
     "G1 Key im Python-Schritt": (
         "MERGE_TOKEN: ${{ steps.merge-token.outputs.token }}",
-        "MERGE_TOKEN: ${{ steps.merge-token.outputs.token }}\n          AGENT_KEY: ${{ secrets.AGENT_APP_KEY }}",
+        "MERGE_TOKEN: ${{ steps.merge-token.outputs.token }}\n"
+        "          AGENT_KEY: ${{ secrets.AGENT_APP_KEY }}",
     ),
     "G1 Job-Rechte erweitert": (
         "      checks: write",
