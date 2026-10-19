@@ -21,6 +21,12 @@ def hat(n):
     return os.path.exists(os.path.join(fx, n))
 
 
+def wer():
+    """Welches Token hat der Aufruf? (Marker statt echter Werte)"""
+    t = os.environ.get("GH_TOKEN", "")
+    return "app" if t == "APP-TOKEN-XYZ" else "default" if t == "DEFAULT-TOKEN-ABC" else "anderes"
+
+
 def log(t):
     open(os.path.join(fx, "writes.log"), "a").write(t + "\n")
 
@@ -33,6 +39,13 @@ def geschrieben(praefix):
 def zaehle():
     """Zaehlt Abfragen des PR nach dem Auto-Merge-Aufruf (simuliert verzoegerten Merge)."""
     p = os.path.join(fx, "zaehler")
+    n = int(open(p).read()) if os.path.exists(p) else 0
+    open(p, "w").write(str(n + 1))
+    return n
+
+
+def zaehle_main():
+    p = os.path.join(fx, "mruns_zaehler")
     n = int(open(p).read()) if os.path.exists(p) else 0
     open(p, "w").write(str(n + 1))
     return n
@@ -51,10 +64,12 @@ if a[0] == "api":
     if methode in ("POST", "PATCH") and "check-runs" in path:
         concl = [x.split("=", 1)[1] for x in a if x.startswith("conclusion=")][0]
         log(("check-patch " if methode == "PATCH" else "check ") + concl)
+        log("tok check " + wer())
     elif methode == "DELETE" and "/git/refs/heads/" in path:
         if hat("fail_delete"):
             fehler("HTTP 403: Resource not accessible by integration", 1)
         log("branch-delete " + path.split("/git/refs/heads/")[1])
+        log("tok branch-delete " + wer())
     elif path == "graphql":
         if hat("fail_graphql"):
             fehler("HTTP 403", 1)
@@ -75,7 +90,12 @@ if a[0] == "api":
         sha = query.get("head_sha", [""])[0]
         if sha == json.loads(load("main.json"))["sha"]:
             nach = hat("mainruns_nach.json") and geschrieben("auto")
-            print(load("mainruns_nach.json" if nach else "mainruns.json"))
+            datei = "mainruns_nach.json" if nach else "mainruns.json"
+            if nach and hat("mainruns_spaeter.json"):
+                z = zaehle_main()
+                if z >= int(load("mainruns_spaeter_ab")):
+                    datei = "mainruns_spaeter.json"
+            print(load(datei))
         else:
             print(load("prruns.json"))
     elif "/actions/runs/" in path:
@@ -112,17 +132,24 @@ if a[0] == "api":
         fehler(f"unbekannt {a}", 2)
 elif a[:2] == ["pr", "ready"]:
     log("ready")
+    log("tok ready " + wer())
 elif a[:2] == ["pr", "merge"] and "--disable-auto" in a:
     log("disable-auto")
+    log("tok merge-disable " + wer())
 elif a[:2] == ["pr", "merge"] and "--auto" in a:
+    if hat("fail_merge"):
+        fehler("HTTP 403: Resource not accessible by integration", 1)
     log("auto " + a[a.index("--match-head-commit") + 1])
+    log("tok merge-auto " + wer())
 elif a[:2] == ["workflow", "run"]:
     if hat("fail_dispatch"):
         fehler("HTTP 403: Resource not accessible by integration", 1)
     log("ci-dispatch " + a[a.index("--ref") + 1])
+    log("tok ci-dispatch " + wer())
 elif a[:2] == ["issue", "close"]:
     if hat("fail_issue"):
         fehler("HTTP 403: Resource not accessible by integration", 1)
     log("issue-close " + a[2])
+    log("tok issue-close " + wer())
 else:
     fehler(f"unbekannter Aufruf {a}", 2)
