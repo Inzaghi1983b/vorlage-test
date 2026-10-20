@@ -72,6 +72,35 @@ MUTANTEN = {
     "Warten ohne Zeitlimit-Ende": ("for i in range(WARTE_VERSUCHE + 1):", "for i in range(1):"),
     "Kein Merge-Zaehler nach --auto": ('STAND["gemergt"] += 1  # ab jetzt', "pass  # ab jetzt"),
     "Warten: Lesefehler nicht gezaehlt": ('STAND["fehler"] += 1', "pass"),
+    "G1 Merge mit Standard-Token": ("head_sha, token=MERGE_TOKEN)", "head_sha)"),
+    "G1 Ready mit Standard-Token": ('"--repo", REPO, token=MERGE_TOKEN)', '"--repo", REPO)'),
+    "G1 Fehlendes App-Token ignoriert": ("if not MERGE_TOKEN:", "if False:"),
+    "G1 App-Token wird ausgegeben": (
+        'MERGE_TOKEN = os.environ.get("MERGE_TOKEN", "")',
+        'MERGE_TOKEN = os.environ.get("MERGE_TOKEN", ""); print(MERGE_TOKEN)',
+    ),
+    "G1 Mint mit zusaetzlichem Recht": (
+        "permission-pull-requests: write",
+        "permission-pull-requests: write\n          permission-actions: write",
+    ),
+    "G1 Mint ohne Repo-Beschraenkung": (
+        "repositories: ${{ github.event.repository.name }}",
+        "# keine Einschraenkung",
+    ),
+    "G1 Mint ohne continue-on-error": ("continue-on-error: true", "continue-on-error: false"),
+    "G1 Key im Python-Schritt": (
+        "MERGE_TOKEN: ${{ steps.merge-token.outputs.token }}",
+        "MERGE_TOKEN: ${{ steps.merge-token.outputs.token }}\n"
+        "          AGENT_KEY: ${{ secrets.AGENT_APP_KEY }}",
+    ),
+    "G1 Job-Rechte erweitert": (
+        "      checks: write",
+        "      checks: write\n      packages: write",
+    ),
+    "G1 Warten auf Push-CI entfernt": (
+        'for _ in range(CI_WARTE_VERSUCHE if zustand == "keine" else 0):',
+        "for _ in range(0):",
+    ),
     "Auto-Merge-Pflicht entfernt": ('if not repo.get("allow_auto_merge"):', "if False:"),
 }
 

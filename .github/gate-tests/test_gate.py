@@ -119,6 +119,10 @@ def lauf(
     wartet=None,
     abfragen=None,
     commitpulls=None,
+    mtoken="APP-TOKEN-XYZ",
+    toks=None,
+    spaeter=None,
+    spaeter_ab=2,
 ):
     fx = tempfile.mkdtemp()
     for n, v in (
@@ -141,10 +145,13 @@ def lauf(
         ("pr_nach", nach),
         ("pulls", pulls),
         ("mainruns_nach", mainruns_nach),
+        ("mainruns_spaeter", spaeter),
         ("pr_wartet", wartet),
     ):
         if wert_ is not None:
             json.dump(wert_, open(os.path.join(fx, name_ + ".json"), "w"))
+    if spaeter is not None:
+        open(os.path.join(fx, "mainruns_spaeter_ab"), "w").write(str(spaeter_ab))
     if abfragen is not None:
         open(os.path.join(fx, "merge_nach_abfragen"), "w").write(str(abfragen))
     for m_ in marker:
@@ -162,6 +169,9 @@ def lauf(
         HEAD_SHA=head,
         PYTHONIOENCODING="utf-8",
         WARTE_SEKUNDEN="0",
+        CI_WARTE_SEKUNDEN="0",
+        GH_TOKEN="DEFAULT-TOKEN-ABC",
+        MERGE_TOKEN=mtoken,
     )
     r = subprocess.run(
         [sys.executable, "-I", GATE],
@@ -173,12 +183,20 @@ def lauf(
     wl = os.path.join(fx, "writes.log")
     alle = open(wl).read().strip().splitlines() if os.path.exists(wl) else []
     cs = [x for x in alle if x.startswith("check")]
-    log = [x for x in alle if not x.startswith("check")]
+    tk = [x for x in alle if x.startswith("tok ")]
+    log = [x for x in alle if not x.startswith(("check", "tok "))]
     ok = (
         (r.returncode == 0) == (erwartet == "pass")
         and (writes is None or log == writes)
         and (check is None or cs == check)
     )
+    ok = (
+        ok
+        and "APP-TOKEN-XYZ" not in r.stdout + r.stderr
+        and "DEFAULT-TOKEN-ABC" not in r.stdout + r.stderr
+    )
+    if toks is not None:
+        ok = ok and tk == toks
     if stdout is not None:
         ok = ok and all(x in r.stdout for x in stdout)
     if check is not None:
@@ -1935,6 +1953,258 @@ R(
         mainruns_nach=NEU_OHNE_CI,
         check=["check success"],
         writes=VOLL,
+    )
+)
+
+
+# --- G1: Merge mit App-Token (Token-Trennung, fail closed, YAML-Gates, Push-CI-Wartezeit) ---
+CHK = "tok check default"
+MERGE_APP = "tok merge-auto app"
+READY_APP = "tok ready app"
+NACH = ["tok ci-dispatch default", "tok issue-close default", "tok branch-delete default"]
+
+# Token-Trennung: ready/merge nur mit dem App-Token, alles andere mit dem Standard-Token
+R(
+    lauf(
+        "G1 Token: Merge mit App-Token, Check mit Standard-Token",
+        "pass",
+        toks=[CHK, MERGE_APP],
+        check=["check success"],
+        writes=A,
+    )
+)
+R(
+    lauf(
+        "G1 Token: Draft -> ready und merge mit App-Token",
+        "pass",
+        prd=pr(draft=True),
+        toks=[CHK, READY_APP, MERGE_APP],
+        writes=["ready"] + A,
+    )
+)
+R(
+    lauf(
+        "G1 Token: voller Ablauf, Nachlauf-Schritte mit Standard-Token",
+        "pass",
+        prd=mit_ref(),
+        nach=gemergt(),
+        closing=issues(7),
+        mainruns_nach=NEU_OHNE_CI,
+        toks=[CHK, MERGE_APP] + NACH,
+        writes=VOLL,
+    )
+)
+R(
+    lauf(
+        "G1 Token: Verstoss -> nur disable-auto mit Standard-Token, kein App-Token",
+        "fail",
+        [datei("pyproject.toml")],
+        toks=["tok merge-disable default", CHK],
+        writes=D,
+    )
+)
+R(lauf("G1 Token: Mensch-PR -> kein App-Token", "pass", prd=pr(user=MENSCH), toks=[CHK], writes=[]))
+R(
+    lauf(
+        "G1 Token: Auto-Merge schon aktiv -> kein weiterer Merge",
+        "pass",
+        prd=mit_ref(auto_merge=WARTET),
+        toks=[CHK],
+        writes=[],
+    )
+)
+R(
+    lauf(
+        "G1 Token: Retry gemergter PR nutzt nie das App-Token",
+        "pass",
+        prd=gemergt(),
+        closing=issues(7),
+        toks=["tok issue-close default", "tok branch-delete default"],
+        writes=["issue-close 7", BRANCH],
+    )
+)
+R(
+    n_lauf(
+        "G1 Token: Neubewertung mergt mit App-Token",
+        "pass",
+        prd=mit_ref(),
+        nach=gemergt(),
+        closing=issues(7),
+        mainruns_nach=NEU_OHNE_CI,
+        toks=[CHK, MERGE_APP] + NACH,
+        writes=VOLL,
+    )
+)
+
+# Fail closed: ohne App-Token weder Ready noch Merge
+R(
+    lauf(
+        "G1 Fail closed: App-Token fehlt -> kein Merge, Exit 1, Check bleibt success",
+        "fail",
+        mtoken="",
+        toks=[CHK],
+        check=["check success"],
+        writes=[],
+        stdout=["App-Token fuer Ready/Merge fehlt"],
+    )
+)
+R(
+    lauf(
+        "G1 Fail closed: App-Token fehlt bei Draft -> auch kein ready",
+        "fail",
+        mtoken="",
+        prd=pr(draft=True),
+        toks=[CHK],
+        writes=[],
+    )
+)
+R(
+    lauf(
+        "G1 Ohne App aber Auto-Merge aus -> weiter ok (nur Check)",
+        "pass",
+        mtoken="",
+        repo={"default_branch": "main", "allow_auto_merge": False},
+        toks=[CHK],
+        check=["check success"],
+        writes=[],
+    )
+)
+R(
+    lauf(
+        "G1 Fail closed: App-Token fehlt, Verstoss -> Check failure und disable-auto wie bisher",
+        "fail",
+        [datei("pyproject.toml")],
+        mtoken="",
+        toks=["tok merge-disable default", CHK],
+        writes=D,
+    )
+)
+R(
+    lauf(
+        "G1 Fail closed: Merge scheitert (403) -> Exit 1, nichts gemergt",
+        "fail",
+        marker=["fail_merge"],
+        toks=[CHK],
+        check=["check success"],
+        writes=[],
+    )
+)
+R(
+    n_lauf(
+        "G1 Fail closed: Neubewertung ohne App-Token -> kein Merge, Exit 1",
+        "fail",
+        mtoken="",
+        prd=mit_ref(),
+        toks=[CHK],
+        writes=[],
+    )
+)
+
+# Push-CI von main nach dem App-Merge: warten, Dispatch nur als Fallback
+R(
+    lauf(
+        "G1 Push-CI erscheint nach 2 Abfragen -> kein Dispatch",
+        "pass",
+        prd=mit_ref(),
+        nach=gemergt(),
+        closing=issues(7),
+        mainruns_nach=NEU_OHNE_CI,
+        spaeter=GRUEN_MAIN,
+        spaeter_ab=2,
+        toks=[CHK, MERGE_APP, "tok issue-close default", "tok branch-delete default"],
+        writes=A + ["issue-close 7", BRANCH],
+    )
+)
+R(
+    lauf(
+        "G1 Push-CI bleibt aus -> Dispatch als Fallback mit Standard-Token",
+        "pass",
+        prd=mit_ref(),
+        nach=gemergt(),
+        closing=issues(7),
+        mainruns_nach=NEU_OHNE_CI,
+        toks=[CHK, MERGE_APP] + NACH,
+        writes=VOLL,
+    )
+)
+
+
+# YAML-Gates (statische Pruefung der Workflow-Datei)
+def yaml_fall(name, bedingung):
+    print(f"{'OK  ' if bedingung else 'FEHL'} {name}")
+    return bool(bedingung)
+
+
+MINT = re.search(r"- name: App-Token nur fuer Ready und Merge.*?(?=\n      - name:)", yml, re.S)
+MINT_BLOCK = MINT.group(0) if MINT else ""
+JOB_PERM = re.search(r"\n    permissions:\n(.*?)\n    steps:", yml, re.S)
+JOB_PERM_ZEILEN = [
+    z.strip().split(" #")[0] for z in (JOB_PERM.group(1).split("\n") if JOB_PERM else [])
+]
+R(yaml_fall("G1 YAML: Mint-Schritt vorhanden", bool(MINT_BLOCK)))
+R(
+    yaml_fall(
+        "G1 YAML: genau eine Mint-Action, SHA-gepinnt",
+        yml.count("actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510") == 1,
+    )
+)
+R(
+    yaml_fall(
+        "G1 YAML: Mint-Schritt hat genau contents + pull-requests: write",
+        sorted(re.findall(r"permission-[a-z-]+: \w+", MINT_BLOCK))
+        == ["permission-contents: write", "permission-pull-requests: write"],
+    )
+)
+R(
+    yaml_fall(
+        "G1 YAML: Mint auf dieses Repo beschraenkt",
+        "repositories: ${{ github.event.repository.name }}" in MINT_BLOCK,
+    )
+)
+R(
+    yaml_fall(
+        "G1 YAML: Mint scheitert weich (continue-on-error) und nur mit App-Variable",
+        "continue-on-error: true" in MINT_BLOCK
+        and "if: ${{ vars.AGENT_APP_ID != '' }}" in MINT_BLOCK,
+    )
+)
+R(
+    yaml_fall(
+        "G1 YAML: Private Key nur im Mint-Schritt",
+        yml.count("secrets.AGENT_APP_KEY") == 1
+        and "secrets.AGENT_APP_KEY" in MINT_BLOCK
+        and "AGENT_APP_KEY" not in code,
+    )
+)
+R(
+    yaml_fall(
+        "G1 YAML: Job-Rechte unveraendert (keine neuen dauerhaften Rechte)",
+        sorted(JOB_PERM_ZEILEN)
+        == sorted(
+            [
+                "actions: write",
+                "checks: write",
+                "contents: write",
+                "issues: write",
+                "pull-requests: write",
+            ]
+        ),
+    )
+)
+R(yaml_fall("G1 YAML: globale Rechte leer", "\npermissions: {}\n" in yml))
+R(
+    yaml_fall(
+        "G1 YAML: Standard-Token und Merge-Token getrennt uebergeben",
+        yml.count("GH_TOKEN: ${{ github.token }}") == 1
+        and yml.count("MERGE_TOKEN: ${{ steps.merge-token.outputs.token }}") == 1,
+    )
+)
+R(
+    yaml_fall(
+        "G1 YAML: Trigger unveraendert (workflow_run nach CI)",
+        "workflows: [CI]" in yml
+        and "types: [completed]" in yml
+        and "pull_request_target:" not in yml,
     )
 )
 

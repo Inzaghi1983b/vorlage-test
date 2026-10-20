@@ -11,6 +11,9 @@ name: Agent-Gate
 # gemergten Agenten-Branch loeschen. Kill-Switch: ist die CI des Standard-Branches rot, fehlt sie oder laeuft
 # sie noch, wird agent-gate rot; nach gruener CI auf dem Standard-Branch bewertet das Gate offene
 # Agenten-PRs neu (hoechstens ein Merge je CI-Zyklus).
+# Ready und Merge laufen mit einem kurzlebigen Token der GitHub App (nur contents + pull-requests: write):
+# Der App-Merge startet die Push-CI von main, deren Ende (Akteur App) den Nachlauf ausloest. Ohne App-Token
+# (App fehlt oder Mint scheitert) gibt es keinen Merge (fail closed); der Check agent-gate wird trotzdem gesetzt.
 
 on:
   workflow_run:
@@ -34,9 +37,23 @@ jobs:
       issues: write # nur: verknuepfte Issues nach dem Merge schliessen
       pull-requests: write
     steps:
+      - name: App-Token nur fuer Ready und Merge (kurzlebig, nur dieses Repo)
+        id: merge-token
+        if: ${{ vars.AGENT_APP_ID != '' }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.AGENT_APP_ID }}
+          private-key: ${{ secrets.AGENT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          github-api-url: ${{ github.api_url }}
+          permission-contents: write
+          permission-pull-requests: write
       - name: Pruefen und Auto-Merge aktivieren
         env:
           GH_TOKEN: ${{ github.token }}
+          MERGE_TOKEN: ${{ steps.merge-token.outputs.token }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -65,6 +82,11 @@ jobs:
           CI_DATEI = "ci.yml"
           WARTE_VERSUCHE = 18  # nach --auto hoechstens 18 x 5 s auf den Merge von GitHub warten
           WARTE_SEKUNDEN = float(os.environ.get("WARTE_SEKUNDEN", "5"))
+          CI_WARTE_VERSUCHE = 12  # nach dem Merge hoechstens 12 x 5 s auf die Push-CI von main warten
+          CI_WARTE_SEKUNDEN = float(os.environ.get("CI_WARTE_SEKUNDEN", "5"))
+          # Kurzlebiges App-Token (nur contents + pull-requests: write): ausschliesslich fuer "pr ready" und "pr merge".
+          # Der Merge durch die App loest die echte Push-CI auf main aus (Ereignisse des GITHUB_TOKEN tun das nicht).
+          MERGE_TOKEN = os.environ.get("MERGE_TOKEN", "")
           MAX_NACHLAUF = 20  # offene Agenten-PRs, die nach gruener main-CI neu bewertet werden
 
           ERLAUBT = re.compile(r"^(src|tests)/")
@@ -88,8 +110,9 @@ jobs:
           KEINE_ABWEICHUNG = {"keine", "kein", "nein", "-", "none", "n/a", "entfaellt"}
 
 
-          def gh(*args, fatal=True):
-              r = subprocess.run([*GH, *args], capture_output=True, text=True)
+          def gh(*args, fatal=True, token=None):
+              env = dict(os.environ, GH_TOKEN=token) if token else None
+              r = subprocess.run([*GH, *args], capture_output=True, text=True, env=env)
               if r.returncode != 0:
                   print(f"gh {' '.join(args)} endete mit Code {r.returncode}: {r.stderr.strip()}")
                   if fatal:
@@ -233,7 +256,12 @@ jobs:
               probleme = 0
               # 1) CI auf dem Standard-Branch, falls fuer den neuen Stand noch keine existiert
               zustand, text, _ = main_zustand(standard)
-              if zustand == "keine":
+              for _ in range(CI_WARTE_VERSUCHE if zustand == "keine" else 0):
+                  time.sleep(CI_WARTE_SEKUNDEN)  # der App-Merge startet die Push-CI von main
+                  zustand, text, _ = main_zustand(standard)
+                  if zustand != "keine":
+                      break
+              if zustand == "keine":  # Fallback: Push-CI blieb aus
                   rc, _, _ = versuche("workflow", "run", CI_DATEI, "--repo", REPO, "--ref", standard)
                   print("CI auf main ausgeloest." if rc == 0 else "CI auf main NICHT ausgeloest.")
                   probleme += rc != 0
@@ -422,12 +450,17 @@ jobs:
                   # Sonst wuerde `gh pr merge --auto` einen bereits gruenen PR sofort direkt mergen.
                   print("Auto-Merge ist im Repo nicht erlaubt: keine Integration, Draft-Status unveraendert.")
                   return 0
+              if not MERGE_TOKEN:
+                  print("STOPP: App-Token fuer Ready/Merge fehlt (Mint-Schritt fehlgeschlagen oder App nicht "
+                        "installiert): kein Ready, kein Merge.")
+                  STAND["fehler"] += 1
+                  return 1
               if pr.get("draft"):
-                  gh("pr", "ready", pr_nr, "--repo", REPO)
+                  gh("pr", "ready", pr_nr, "--repo", REPO, token=MERGE_TOKEN)
               if pr.get("auto_merge"):
                   print("Auto-Merge war schon aktiv; der Check dieses Stands ist trotzdem bestanden.")
                   return 0
-              gh("pr", "merge", pr_nr, "--repo", REPO, "--auto", "--squash", "--match-head-commit", head_sha)
+              gh("pr", "merge", pr_nr, "--repo", REPO, "--auto", "--squash", "--match-head-commit", head_sha, token=MERGE_TOKEN)
               STAND["gemergt"] += 1  # ab jetzt laeuft/wartet ein Merge: kein weiterer Merge in diesem CI-Zyklus
               print("Auto-Merge aktiviert; GitHub merged, sobald alle Pflicht-Checks gruen sind.")
               if warte_auf_merge(pr_nr, head_sha):
